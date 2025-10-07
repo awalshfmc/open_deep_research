@@ -9,6 +9,7 @@ from typing import Annotated, Any, Dict, List, Literal, Optional
 
 import aiohttp
 from langchain.chat_models import init_chat_model
+from langchain_community.tools import DuckDuckGoSearchResults
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
@@ -211,6 +212,214 @@ async def summarize_webpage(model: BaseChatModel, webpage_content: str) -> str:
         # Other errors during summarization - log and return original content
         logging.warning(f"Summarization failed with error: {str(e)}, returning original content")
         return webpage_content
+
+##########################
+# DuckDuckGo Search Tool Utils
+##########################
+DUCKDUCKGO_SEARCH_DESCRIPTION = (
+    "A privacy-focused search engine that provides comprehensive web search results. "
+    "Useful for general web searches when you need to find information without tracking."
+)
+
+@tool(description=DUCKDUCKGO_SEARCH_DESCRIPTION)
+async def duckduckgo_search(
+    queries: List[str],
+    max_results: Annotated[int, InjectedToolArg] = 5,
+    config: RunnableConfig = None
+) -> str:
+    """Fetch and summarize search results from DuckDuckGo search API.
+
+    Args:
+        queries: List of search queries to execute
+        max_results: Maximum number of results to return per query
+        config: Runtime configuration for model settings
+
+    Returns:
+        Formatted string containing summarized search results
+    """
+    # Step 1: Execute search queries asynchronously
+    search_results = await duckduckgo_search_async(
+        queries,
+        max_results=max_results,
+        config=config
+    )
+    
+    # Step 2: Deduplicate results by URL to avoid processing the same content multiple times
+    unique_results = {}
+    for response in search_results:
+        for result in response['results']:
+            url = result['link']
+            if url not in unique_results:
+                unique_results[url] = {
+                    'title': result['title'],
+                    'content': result['snippet'],
+                    'url': result['link'],
+                    "query": response['query']
+                }
+    
+    # Step 3: Set up the summarization model with configuration
+    configurable = Configuration.from_runnable_config(config)
+    
+    # Initialize summarization model with retry logic
+    model_api_key = get_api_key_for_model(configurable.summarization_model, config)
+    summarization_model = init_chat_model(
+        model=configurable.summarization_model,
+        max_tokens=configurable.summarization_model_max_tokens,
+        api_key=model_api_key,
+        tags=["langsmith:nostream"]
+    ).with_structured_output(Summary).with_retry(
+        stop_after_attempt=configurable.max_structured_output_retries
+    )
+    
+    # Step 4: Create summarization tasks for content that needs summarization
+    async def noop():
+        """No-op function for results without content."""
+        return None
+    
+    summarization_tasks = [
+        noop() if not result.get("content") or len(result["content"]) < 100
+        else summarize_webpage(
+            summarization_model, 
+            result['content'][:configurable.max_content_length]
+        )
+        for result in unique_results.values()
+    ]
+    
+    # Step 5: Execute all summarization tasks in parallel
+    summaries = await asyncio.gather(*summarization_tasks)
+    
+    # Step 6: Combine results with their summaries
+    summarized_results = {
+        url: {
+            'title': result['title'], 
+            'content': result['content'] if summary is None else summary
+        }
+        for url, result, summary in zip(
+            unique_results.keys(), 
+            unique_results.values(), 
+            summaries
+        )
+    }
+    
+    # Step 7: Format the final output
+    if not summarized_results:
+        return "No valid search results found. Please try different search queries or use a different search API."
+    
+    formatted_output = "Search results: \n\n"
+    for i, (url, result) in enumerate(summarized_results.items()):
+        formatted_output += f"\n\n--- SOURCE {i+1}: {result['title']} ---\n"
+        formatted_output += f"URL: {url}\n\n"
+        formatted_output += f"SUMMARY:\n{result['content']}\n\n"
+        formatted_output += "\n\n" + "-" * 80 + "\n"
+    
+    return formatted_output
+
+async def duckduckgo_search_async(
+    search_queries: List[str], 
+    max_results: int = 5, 
+    config: RunnableConfig = None
+) -> List[Dict[str, Any]]:
+    """Execute multiple DuckDuckGo search queries asynchronously.
+    
+    Args:
+        search_queries: List of search query strings to execute
+        max_results: Maximum number of results per query
+        config: Runtime configuration (unused for DuckDuckGo but kept for consistency)
+        
+    Returns:
+        List of search result dictionaries from DuckDuckGo API
+    """
+    # Initialize the DuckDuckGo search tool
+    ddg_search = DuckDuckGoSearchResults(num_results=max_results)
+    
+    # Create search tasks for parallel execution
+    async def search_single_query(query: str) -> Dict[str, Any]:
+        """Execute a single DuckDuckGo search query."""
+        try:
+            # Run the search in a thread pool to avoid blocking
+            loop = asyncio.get_event_loop()
+            raw_results = await loop.run_in_executor(None, ddg_search.run, query)
+            
+            # Parse the string results - DuckDuckGoSearchResults returns a string
+            # with format: "snippet: ..., title: ..., link: ..., snippet: ..., title: ..., link: ..."
+            results = []
+            if isinstance(raw_results, str):
+                # Split the string into individual results
+                # Each result contains snippet, title, and link
+                parts = raw_results.split(', title: ')
+                current_result = {}
+                
+                for i, part in enumerate(parts):
+                    if i == 0:
+                        # First part is just the snippet
+                        if part.startswith('snippet: '):
+                            current_result['snippet'] = part[9:]  # Remove 'snippet: '
+                    else:
+                        # Process previous result if we have one
+                        if current_result:
+                            results.append(current_result.copy())
+                        
+                        # Start new result with title
+                        current_result = {'snippet': ''}
+                        
+                        # Split this part into title and link (and possibly next snippet)
+                        if ', link: ' in part:
+                            title_and_rest = part.split(', link: ', 1)
+                            current_result['title'] = title_and_rest[0]
+                            
+                            # The rest contains link and possibly next snippet
+                            link_and_rest = title_and_rest[1]
+                            if ', snippet: ' in link_and_rest:
+                                link_parts = link_and_rest.split(', snippet: ', 1)
+                                current_result['link'] = link_parts[0]
+                                current_result['snippet'] = link_parts[1]
+                            else:
+                                current_result['link'] = link_and_rest
+                        else:
+                            current_result['title'] = part
+                
+                # Add the last result if we have one
+                if current_result and current_result.get('title'):
+                    results.append(current_result)
+                
+                # Clean up results - ensure all required fields are present
+                cleaned_results = []
+                for result in results:
+                    if all(key in result for key in ['title', 'link']):
+                        cleaned_results.append({
+                            'title': result['title'].strip(),
+                            'snippet': result.get('snippet', '').strip(),
+                            'link': result['link'].strip()
+                        })
+                
+                return {
+                    'query': query,
+                    'results': cleaned_results
+                }
+            else:
+                # Fallback for unexpected result format
+                return {
+                    'query': query,
+                    'results': [{
+                        'title': f"DuckDuckGo Search: {query}",
+                        'snippet': str(raw_results),
+                        'link': f"https://duckduckgo.com/?q={query.replace(' ', '+')}"
+                    }]
+                }
+            
+        except Exception as e:
+            logging.warning(f"DuckDuckGo search failed for query '{query}': {str(e)}")
+            return {
+                'query': query,
+                'results': []
+            }
+    
+    # Execute all search queries in parallel
+    search_results = await asyncio.gather(*[
+        search_single_query(query) for query in search_queries
+    ])
+    
+    return search_results
 
 ##########################
 # Reflection Tool Utils
@@ -532,7 +741,7 @@ async def get_search_tool(search_api: SearchAPI):
     """Configure and return search tools based on the specified API provider.
     
     Args:
-        search_api: The search API provider to use (Anthropic, OpenAI, Tavily, or None)
+        search_api: The search API provider to use (Anthropic, OpenAI, Tavily, DuckDuckGo, or None)
         
     Returns:
         List of configured search tool objects for the specified provider
@@ -552,6 +761,16 @@ async def get_search_tool(search_api: SearchAPI):
     elif search_api == SearchAPI.TAVILY:
         # Configure Tavily search tool with metadata
         search_tool = tavily_search
+        search_tool.metadata = {
+            **(search_tool.metadata or {}), 
+            "type": "search", 
+            "name": "web_search"
+        }
+        return [search_tool]
+        
+    elif search_api == SearchAPI.DUCKDUCKGO:
+        # Configure DuckDuckGo search tool with metadata
+        search_tool = duckduckgo_search
         search_tool.metadata = {
             **(search_tool.metadata or {}), 
             "type": "search", 
