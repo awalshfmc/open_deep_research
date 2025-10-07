@@ -1016,6 +1016,15 @@ MODEL_TOKEN_LIMITS = {
     "openai:o3-pro": 200000,
     "openai:o1": 200000,
     "openai:o1-pro": 200000,
+    "azure_openai:gpt-4.1-mini": 1047576,
+    "azure_openai:gpt-4.1": 1047576,
+    "azure_openai:gpt-4o-mini": 128000,
+    "azure_openai:gpt-4o": 128000,
+    "azure_openai:gpt-35-turbo": 16385,
+    "azure_openai:gpt-4": 128000,
+    "azure_openai:o1": 200000,
+    "azure_openai:o1-mini": 200000,
+    "azure_openai:o1-pro": 200000,
     "anthropic:claude-opus-4": 200000,
     "anthropic:claude-sonnet-4": 200000,
     "anthropic:claude-3-7-sonnet": 200000,
@@ -1085,6 +1094,84 @@ def remove_up_to_last_ai_message(messages: list[MessageLikeRepresentation]) -> l
     return messages
 
 ##########################
+# Azure OpenAI Configuration Utils
+##########################
+
+def configure_azure_openai():
+    """Configure Azure OpenAI environment variables if they are set.
+    
+    This function sets the required environment variables for Azure OpenAI
+    based on the values in the .env file or existing environment variables.
+    """
+    azure_key = os.getenv("AZURE_OPENAI_API_KEY")
+    azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT") 
+    azure_version = os.getenv("AZURE_OPENAI_API_VERSION", "2025-03-01-preview")
+    
+    if azure_key and azure_endpoint:
+        os.environ["AZURE_OPENAI_API_KEY"] = azure_key
+        os.environ["AZURE_OPENAI_ENDPOINT"] = azure_endpoint
+        os.environ["OPENAI_API_VERSION"] = azure_version
+
+def init_azure_chat_model(model_string: str, **kwargs):
+    """Initialize Azure OpenAI chat model with proper deployment configuration.
+    
+    Args:
+        model_string: Azure model string in format "azure_openai:model_name"
+        **kwargs: Additional arguments to pass to init_chat_model
+        
+    Returns:
+        Configured Azure OpenAI chat model
+    """
+    configure_azure_openai()
+    
+    # Extract model name from the string
+    if ":" in model_string:
+        _, model_name = model_string.split(":", 1)
+    else:
+        model_name = model_string
+    
+    # Map model names to common Azure deployment names
+    # These can be customized based on your Azure deployment naming
+    deployment_map = {
+        "gpt-4.1": "gpt-41",
+        "gpt-4.1-mini": "gpt-41-mini", 
+        "gpt-4o": "gpt-4o",
+        "gpt-4o-mini": "gpt-4o-mini",
+        "gpt-35-turbo": "gpt-35-turbo",
+        "gpt-4": "gpt-4",
+        "o1": "o1",
+        "o1-mini": "o1-mini",
+        "o1-pro": "o1-pro"
+    }
+    
+    # Get deployment name (default to model name if not in map)
+    azure_deployment = deployment_map.get(model_name, model_name)
+    
+    return init_chat_model(
+        model_string,
+        azure_deployment=azure_deployment,
+        **kwargs
+    )
+
+# Patch init_chat_model to handle Azure models automatically
+original_init_chat_model = init_chat_model
+
+def patched_init_chat_model(*args, **kwargs):
+    """Patched version of init_chat_model that handles Azure OpenAI models."""
+    # Check if first arg is a model string starting with azure_openai
+    if args and isinstance(args[0], str) and args[0].startswith("azure_openai:"):
+        return init_azure_chat_model(*args, **kwargs)
+    # Check if model kwarg is azure
+    elif kwargs.get("model", "").startswith("azure_openai:"):
+        model_string = kwargs.pop("model")
+        return init_azure_chat_model(model_string, **kwargs)
+    else:
+        return original_init_chat_model(*args, **kwargs)
+
+# Apply the patch
+init_chat_model = patched_init_chat_model
+
+##########################
 # Misc Utils
 ##########################
 
@@ -1112,12 +1199,19 @@ def get_api_key_for_model(model_name: str, config: RunnableConfig):
     """Get API key for a specific model from environment or config."""
     should_get_from_config = os.getenv("GET_API_KEYS_FROM_CONFIG", "false")
     model_name = model_name.lower()
+    
+    # Configure Azure OpenAI environment variables if needed
+    if model_name.startswith("azure_openai:"):
+        configure_azure_openai()
+    
     if should_get_from_config.lower() == "true":
         api_keys = config.get("configurable", {}).get("apiKeys", {})
         if not api_keys:
             return None
         if model_name.startswith("openai:"):
             return api_keys.get("OPENAI_API_KEY")
+        elif model_name.startswith("azure_openai:"):
+            return api_keys.get("AZURE_OPENAI_API_KEY")
         elif model_name.startswith("anthropic:"):
             return api_keys.get("ANTHROPIC_API_KEY")
         elif model_name.startswith("google"):
@@ -1126,6 +1220,8 @@ def get_api_key_for_model(model_name: str, config: RunnableConfig):
     else:
         if model_name.startswith("openai:"): 
             return os.getenv("OPENAI_API_KEY")
+        elif model_name.startswith("azure_openai:"):
+            return os.getenv("AZURE_OPENAI_API_KEY")
         elif model_name.startswith("anthropic:"):
             return os.getenv("ANTHROPIC_API_KEY")
         elif model_name.startswith("google"):

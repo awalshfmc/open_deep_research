@@ -126,7 +126,7 @@ class Configuration(BaseModel):
             "x_oap_ui_config": {
                 "type": "text",
                 "default": "openai:gpt-4.1-mini",
-                "description": "Model for summarizing research results from Tavily search results"
+                "description": "Model for summarizing research results from Tavily search results. Use 'azure_openai:model-name' for Azure OpenAI models."
             }
         }
     )
@@ -158,7 +158,7 @@ class Configuration(BaseModel):
             "x_oap_ui_config": {
                 "type": "text",
                 "default": "openai:gpt-4.1",
-                "description": "Model for conducting research. NOTE: Make sure your Researcher Model supports the selected search API."
+                "description": "Model for conducting research. Use 'azure_openai:model-name' for Azure OpenAI models. NOTE: Make sure your Researcher Model supports the selected search API."
             }
         }
     )
@@ -178,7 +178,7 @@ class Configuration(BaseModel):
             "x_oap_ui_config": {
                 "type": "text",
                 "default": "openai:gpt-4.1",
-                "description": "Model for compressing research findings from sub-agents. NOTE: Make sure your Compression Model supports the selected search API."
+                "description": "Model for compressing research findings from sub-agents. Use 'azure_openai:model-name' for Azure OpenAI models. NOTE: Make sure your Compression Model supports the selected search API."
             }
         }
     )
@@ -198,7 +198,7 @@ class Configuration(BaseModel):
             "x_oap_ui_config": {
                 "type": "text",
                 "default": "openai:gpt-4.1",
-                "description": "Model for writing the final report from all research findings"
+                "description": "Model for writing the final report from all research findings. Use 'azure_openai:model-name' for Azure OpenAI models."
             }
         }
     )
